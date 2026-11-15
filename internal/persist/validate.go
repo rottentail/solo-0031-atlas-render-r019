@@ -42,7 +42,7 @@ func Validate(s model.State) error {
 		}
 	}
 	for id, j := range s.Jobs {
-		if id != j.ID || j.SnapshotID != j.Payload.ID || j.Scale < 1 || j.Scale > 2 || j.Attempt < 1 {
+		if id != j.ID || j.SnapshotID == "" || j.Scale < 1 || j.Scale > 2 || j.Attempt < 1 {
 			return fmt.Errorf("invalid job %s", id)
 		}
 		if _, ok := s.Snapshots[j.SnapshotID]; !ok {
@@ -60,9 +60,6 @@ func Validate(s model.State) error {
 			}
 		default:
 			return fmt.Errorf("invalid job state")
-		}
-		if e := ValidateSnapshot(j.Payload); e != nil {
-			return e
 		}
 	}
 	for id, a := range s.Artifacts {

@@ -21,11 +21,13 @@ python3 scripts/walkthrough.py --workflow retire-asset
 python3 scripts/walkthrough.py --workflow cancel-render
 python3 scripts/walkthrough.py --workflow retry-render
 python3 scripts/walkthrough.py --workflow recover-render
+python3 scripts/walkthrough.py --workflow attempt-ownership
+python3 scripts/walkthrough.py --workflow state-compat
 python3 scripts/walkthrough.py --workflow import-package
 python3 scripts/walkthrough.py --workflow compare-renders
 ```
 
-脚本在临时状态目录启动实际服务，通过 HTTP 完成操作后停止服务，输出任务状态和 PNG 摘要；`--out` 保存可查看的合成示例。恢复流程会强制结束脚本自己启动的服务进程，再验证恢复结果。所有工作流编号见 `.project-manifest.json`。
+脚本在临时状态目录启动实际服务，通过 HTTP 完成操作后停止服务，输出任务状态和 PNG 摘要；`--out` 保存可查看的合成示例。恢复流程会强制结束脚本自己启动的服务进程，再验证恢复结果；`attempt-ownership` 在取消、立即重试与退出相遇时核对执行句柄数和每任务结果数，`state-compat` 用旧格式状态文件核对启动、任务详情和后续完成。所有工作流编号见 `.project-manifest.json`。
 
 ## 场景到结果
 

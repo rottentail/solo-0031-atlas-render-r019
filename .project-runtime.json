@@ -71,6 +71,14 @@
     {
       "workflow_id": "observe-service",
       "command": "python3 scripts/walkthrough.py --workflow observe-service"
+    },
+    {
+      "workflow_id": "attempt-ownership",
+      "command": "python3 scripts/walkthrough.py --workflow attempt-ownership"
+    },
+    {
+      "workflow_id": "state-compat",
+      "command": "python3 scripts/walkthrough.py --workflow state-compat"
     }
   ],
   "environment": {

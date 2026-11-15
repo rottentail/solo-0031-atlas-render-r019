@@ -101,6 +101,34 @@ class Demo:
     def submit(self, snapshot, key='render-one', scale=1):
         return self.call('POST', '/v1/jobs', {'snapshotId': snapshot['id'], 'scale': scale}, 202, {'Idempotency-Key': key})
 
+    def status(self):
+        return self.call('GET', '/v1/status')
+
+    def waiting_running(self, job_id):
+        """Wait until the executor has claimed the job and registered its attempt."""
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            job = self.call('GET', '/v1/jobs/' + job_id)
+            if job['state'] == 'running' and self.status()['activeExecutions'] > 0:
+                return job
+            if job['state'] in ('succeeded', 'failed', 'cancelled'):
+                raise RuntimeError(f'unexpected job outcome: {job}')
+            time.sleep(.005)
+        raise RuntimeError('render did not start')
+
+    def quiet(self):
+        """Wait until this process owns no execution handle."""
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if self.status()['activeExecutions'] == 0:
+                return
+            time.sleep(.005)
+        raise RuntimeError('execution handles were not released')
+
+    def durable(self):
+        """Read committed state from disk; only call once the server is stopped."""
+        return json.loads((self.directory / 'state.json').read_text())
+
 
 def run(demo, workflow, out):
     d = sample()
@@ -140,12 +168,54 @@ def run(demo, workflow, out):
         corrupt = json.loads(json.dumps(package)); corrupt['snapshot']['document']['width'] += 1
         demo.call('POST', '/v1/imports/corrupt', {'name': '损坏包', 'package': corrupt}, 400)
         demo.call('GET', '/v1/scenes/corrupt', status=404)
-    if workflow in ('cancel-render', 'retry-render', 'recover-render'):
+    if workflow in ('cancel-render', 'retry-render', 'recover-render', 'attempt-ownership', 'state-compat'):
         heavy = sample(); heavy['width'] = 1500; heavy['height'] = 1500
         heavy['layers'] = [dict(heavy['layers'][0], id=f'sheet-{i}', width=1500, height=1500, transform={'scaleX': 1, 'scaleY': 1}) for i in range(16)]
         put(heavy, current['revision'])
         snapshot = demo.call('POST', '/v1/scenes/emblem/snapshots', {'expectedRevision': current['revision'] + 1}, 201)
     job = demo.submit(snapshot)
+    if workflow == 'attempt-ownership':
+        # Attempt 1 owns a live execution handle. Cancel commits, then a retry
+        # immediately reopens the job as attempt 2 while attempt 1 is still
+        # unwinding. Only attempt 2 may publish; only its handle may survive.
+        demo.waiting_running(job['id'])
+        assert demo.status()['activeExecutions'] == 1
+        stopped = demo.call('POST', '/v1/jobs/' + job['id'] + '/cancel')
+        assert stopped['state'] == 'cancelled' and stopped['attempt'] == 1
+        retried = demo.call('POST', '/v1/jobs/' + job['id'] + '/retry', status=202)
+        assert retried['attempt'] == 2 and retried['state'] == 'queued'
+        assert demo.status()['activeExecutions'] <= 1
+        first = demo.wait(job['id'])
+        assert first['attempt'] == 2
+        png = demo.call('GET', '/v1/artifacts/' + first['artifactId'])
+        assert struct.unpack('>II', png[16:24]) == (snapshot['document']['width'], snapshot['document']['height'])
+        demo.quiet(); assert demo.status()['activeExecutions'] == 0
+        # Second job exercises orderly shutdown: the process releases its
+        # handle without committing, and the restart resumes the durable fact.
+        second = demo.submit(snapshot, 'render-two')
+        demo.waiting_running(second['id'])
+        demo.stop()
+        state = demo.durable()
+        interrupted = state['jobs'][second['id']]
+        assert interrupted['state'] == 'running' and interrupted['attempt'] == 1
+        assert 'payload' not in interrupted
+        assert not any(a['jobId'] == second['id'] for a in state['artifacts'].values())
+        assert 'payload' not in state['jobs'][job['id']]
+        demo.start()
+        recovered = demo.wait(second['id'])
+        assert recovered['attempt'] == 1
+        assert any(e['kind'] == 'job.recovered' and e['subject'] == second['id'] for e in demo.call('GET', '/v1/events'))
+        assert demo.call('POST', '/v1/compare', {'left': first['artifactId'], 'right': recovered['artifactId']})['changedPixels'] == 0
+        demo.stop()
+        state = demo.durable()
+        counts = {job['id']: 0, second['id']: 0}
+        for a in state['artifacts'].values():
+            if a['jobId'] in counts:
+                counts[a['jobId']] += 1
+        assert counts == {job['id']: 1, second['id']: 1}, counts
+        assert state['jobs'][job['id']]['attempt'] == 2 and state['jobs'][second['id']]['attempt'] == 1
+        return {'workflow': workflow, 'firstAttempt': 2, 'recoveredState': recovered['state'],
+                'artifactsPerJob': counts, 'executionsAfterShutdown': 0}
     if workflow == 'submit-render':
         assert demo.submit(snapshot)['id'] == job['id']
         demo.call('POST', '/v1/jobs', {'snapshotId': snapshot['id'], 'scale': 2}, 409, {'Idempotency-Key': 'render-one'})
@@ -153,15 +223,51 @@ def run(demo, workflow, out):
         demo.call('POST', '/v1/snapshots/' + snapshot['id'] + '/revoke')
         demo.call('POST', '/v1/jobs', {'snapshotId': snapshot['id'], 'scale': 1}, 409, {'Idempotency-Key': 'blocked-after-revoke'})
     if workflow in ('cancel-render', 'retry-render'):
+        # Cancel only after the executor registered the attempt handle, so the
+        # abort really has to cross from durable commit to executor resource.
+        demo.waiting_running(job['id'])
         stopped = demo.call('POST', '/v1/jobs/' + job['id'] + '/cancel')
         assert stopped['state'] == 'cancelled'
+        demo.quiet()
         if workflow == 'cancel-render':
-            time.sleep(.1); assert demo.call('GET', '/v1/jobs/' + job['id'])['state'] == 'cancelled'
+            time.sleep(.1)
+            assert demo.call('GET', '/v1/jobs/' + job['id'])['state'] == 'cancelled'
+            assert demo.status()['activeExecutions'] == 0
             return {'workflow': workflow, 'state': 'cancelled'}
         job = demo.call('POST', '/v1/jobs/' + job['id'] + '/retry', status=202)
         assert job['attempt'] == 2
     if workflow == 'recover-render':
-        demo.wait(job['id'], wanted=('running',)); demo.stop(abrupt=True); demo.start()
+        demo.waiting_running(job['id']); demo.stop(abrupt=True); demo.start()
+    if workflow == 'state-compat':
+        # Durable files written by the earlier layout carry a full input copy
+        # per job. Such a file must still open and serve the documented job
+        # detail shape, and both finished and retryable facts must survive.
+        done = demo.wait(job['id'])
+        assert done['state'] == 'succeeded'
+        pending = demo.submit(snapshot, 'render-two')
+        demo.waiting_running(pending['id'])
+        assert demo.call('POST', '/v1/jobs/' + pending['id'] + '/cancel')['state'] == 'cancelled'
+        demo.quiet(); demo.stop()
+        state = demo.durable()
+        for stored in state['jobs'].values():
+            stored['payload'] = snapshot
+        (demo.directory / 'state.json').write_text(json.dumps(state))
+        demo.start()
+        for job_id, want in ((job['id'], 'succeeded'), (pending['id'], 'cancelled')):
+            detail = demo.call('GET', '/v1/jobs/' + job_id)
+            assert detail['state'] == want and detail['snapshotId'] == snapshot['id']
+            assert set(detail) <= {'id', 'snapshotId', 'state', 'scale', 'attempt', 'createdAt', 'updatedAt', 'payload', 'error', 'artifactId'}
+            assert {'id', 'snapshotId', 'state', 'scale', 'attempt', 'createdAt', 'updatedAt', 'payload'} <= set(detail)
+            assert detail['payload']['id'] == ''
+        png = demo.call('GET', '/v1/artifacts/' + done['artifactId'])
+        assert hashlib.sha256(png).hexdigest() == state['artifacts'][done['artifactId']]['digest']
+        retried = demo.call('POST', '/v1/jobs/' + pending['id'] + '/retry', status=202)
+        assert retried['attempt'] == 2 and retried['snapshotId'] == snapshot['id']
+        result = demo.wait(pending['id']); assert result['state'] == 'succeeded'
+        demo.stop()
+        rewritten = demo.durable()
+        assert all('payload' not in stored for stored in rewritten['jobs'].values())
+        return {'workflow': workflow, 'state': result['state'], 'legacyFileAccepted': True}
     result = demo.wait(job['id'])
     png = demo.call('GET', '/v1/artifacts/' + result['artifactId'])
     assert png[:8] == b'\x89PNG\r\n\x1a\n'

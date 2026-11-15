@@ -79,6 +79,12 @@ type Snapshot struct {
 	Digest    string           `json:"digest"`
 	CreatedAt time.Time        `json:"createdAt"`
 }
+
+// Job is the durable record of a render promise. It carries only stable facts:
+// identity, the pinned snapshot reference, output scale, attempt number and
+// terminal bookkeeping. The snapshot content is resolved from the immutable
+// snapshot record when the executor starts an attempt; cancellation handles,
+// compiled plans and pixel buffers never enter the persisted state.
 type Job struct {
 	ID         string    `json:"id"`
 	SnapshotID string    `json:"snapshotId"`
@@ -89,7 +95,6 @@ type Job struct {
 	ArtifactID string    `json:"artifactId,omitempty"`
 	CreatedAt  time.Time `json:"createdAt"`
 	UpdatedAt  time.Time `json:"updatedAt"`
-	Payload    Snapshot  `json:"payload"`
 }
 type Artifact struct {
 	ID     string `json:"id"`

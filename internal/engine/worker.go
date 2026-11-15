@@ -9,19 +9,26 @@ import (
 	"errors"
 	"log"
 	"sort"
-	"sync"
 	"time"
 )
 
+// Worker drains the durable queue. It owns every transient resource of a
+// running attempt: the attempt context and cancel handle, the compiled plan
+// and the pixel buffers. None of those enter the persisted state; the durable
+// Job only carries identity, the pinned snapshot reference, scale, attempt
+// number and terminal bookkeeping.
 type Worker struct {
-	store  *persist.Store
-	mu     sync.Mutex
-	active map[string]context.CancelFunc
+	store *persist.Store
+	execs *executionSet
 }
 
 func New(st *persist.Store) *Worker {
-	return &Worker{store: st, active: map[string]context.CancelFunc{}}
+	return &Worker{store: st, execs: newExecutionSet()}
 }
+
+// Recover requeues attempts that were running when the previous process
+// stopped. Recovery is separate from the consumption loop so that startup can
+// finish validating durable facts before any attempt is claimed.
 func (w *Worker) Recover() error {
 	return w.store.Update(func(s *model.State) error {
 		for id, j := range s.Jobs {
@@ -35,14 +42,20 @@ func (w *Worker) Recover() error {
 		return nil
 	})
 }
-func (w *Worker) Cancel(id string) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if cancel := w.active[id]; cancel != nil {
-		cancel()
-	}
+
+// CancelAttempt aborts the execution registered for exactly this attempt
+// identity. A stale notification for an attempt that already finished is a
+// no-op, and it can never reach a newer attempt of the same job.
+func (w *Worker) CancelAttempt(jobID string, attempt int) {
+	w.execs.cancel(jobID, attempt)
 }
+
+// ActiveExecutions reports how many attempt handles this process currently
+// owns. It is a diagnostic for resource ownership.
+func (w *Worker) ActiveExecutions() int { return w.execs.size() }
+
 func (w *Worker) Run(ctx context.Context) {
+	defer w.execs.cancelAll()
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
 	for {
@@ -56,18 +69,35 @@ func (w *Worker) Run(ctx context.Context) {
 		}
 	}
 }
-func (w *Worker) claim() (model.Job, bool, error) {
-	var job model.Job
+
+// attempt is the executor's view of one claimed try. It pins the snapshot
+// reference resolved during the claim transaction so that a later retry or
+// snapshot state change cannot alter what this attempt renders.
+type attempt struct {
+	jobID  string
+	number int
+	scale  int
+	input  model.Snapshot
+}
+
+// current reports whether the durable job still names this attempt as the one
+// allowed to commit. This is the single guard against stale results.
+func (a attempt) current(j model.Job) bool {
+	return j.State == "running" && j.Attempt == a.number
+}
+
+func (w *Worker) claim() (attempt, bool, error) {
+	var out attempt
 	found := false
 	state := w.store.Read()
-	ids := []string{}
+	ids := make([]string, 0, len(state.Jobs))
 	for id, j := range state.Jobs {
 		if j.State == "queued" {
 			ids = append(ids, id)
 		}
 	}
 	if len(ids) == 0 {
-		return job, false, nil
+		return out, false, nil
 	}
 	sort.Slice(ids, func(i, j int) bool {
 		a, b := state.Jobs[ids[i]], state.Jobs[ids[j]]
@@ -81,68 +111,102 @@ func (w *Worker) claim() (model.Job, bool, error) {
 		if j.State != "queued" {
 			return nil
 		}
+		input, ok := s.Snapshots[j.SnapshotID]
+		if !ok {
+			// Unreachable through validated state; fail the promise rather
+			// than spinning on a queue entry that can never render.
+			j.State = "failed"
+			j.Error = "pinned snapshot is missing"
+			j.UpdatedAt = time.Now().UTC()
+			s.Jobs[j.ID] = j
+			s.Emit("job.failed", j.ID)
+			return nil
+		}
 		j.State = "running"
 		j.UpdatedAt = time.Now().UTC()
 		s.Jobs[j.ID] = j
 		s.Emit("job.running", j.ID)
-		job = j
+		out = attempt{jobID: j.ID, number: j.Attempt, scale: j.Scale, input: input}
 		found = true
 		return nil
 	})
-	return job, found, e
+	return out, found, e
 }
+
+// step claims at most one queued attempt, executes it with a context owned by
+// this attempt, and commits the outcome only while the attempt is still the
+// current one.
 func (w *Worker) step(parent context.Context) error {
-	j, ok, e := w.claim()
+	a, ok, e := w.claim()
 	if e != nil || !ok {
 		return e
 	}
-	ctx, cancel := context.WithCancel(parent)
-	defer cancel()
-	w.mu.Lock()
-	w.active[j.ID] = cancel
-	w.mu.Unlock()
-	defer func() { w.mu.Lock(); delete(w.active, j.ID); w.mu.Unlock() }()
-	// Cancellation can commit between claim and tracking; consult the committed state.
-	current := w.store.Read().Jobs[j.ID]
-	if current.State != "running" {
-		cancel()
+	ex := w.execs.begin(parent, a.jobID, a.number)
+	defer w.execs.end(ex)
+
+	// A cancel request can commit between the claim and handle registration.
+	// Such a request found no handle to abort, so re-check the durable job
+	// now that this attempt is registered; the abort is otherwise lost. The
+	// attempt can never commit regardless, because finish re-checks identity.
+	if !a.current(w.store.Read().Jobs[a.jobID]) {
+		ex.cancel()
 	}
-	plan, e := raster.Compile(j.Payload, j.Scale)
-	var data []byte
-	if e == nil {
-		var imgErr error
-		img, imgErr := plan.Render(ctx)
-		e = imgErr
-		if e == nil {
-			data, e = codec.Encode(img)
-		}
-	}
+
+	data, width, height, runErr := execute(ex.ctx, a)
+
+	// A process shutdown cancels the attempt context through its parent. The
+	// durable job keeps its running state so the next process requeues it;
+	// this attempt no longer owns any commit right.
 	if parent.Err() != nil {
 		return nil
 	}
+	return w.finish(a, data, width, height, runErr)
+}
+
+func execute(ctx context.Context, a attempt) ([]byte, int, int, error) {
+	plan, e := raster.Compile(a.input, a.scale)
+	if e != nil {
+		return nil, 0, 0, e
+	}
+	img, e := plan.Render(ctx)
+	if e != nil {
+		return nil, 0, 0, e
+	}
+	data, e := codec.Encode(img)
+	if e != nil {
+		return nil, 0, 0, e
+	}
+	return data, plan.Width, plan.Height, nil
+}
+
+// finish writes the outcome of one attempt. The attempt identity check happens
+// inside the same transaction as the write, so an execution that lost its
+// attempt (through cancel and retry) cannot publish a result or a terminal
+// state over the new attempt.
+func (w *Worker) finish(a attempt, data []byte, width, height int, runErr error) error {
 	return w.store.Update(func(s *model.State) error {
-		v := s.Jobs[j.ID]
-		if v.State != "running" || v.Attempt != j.Attempt {
+		j := s.Jobs[a.jobID]
+		if !a.current(j) {
 			return nil
 		}
-		v.UpdatedAt = time.Now().UTC()
-		if e != nil {
-			if errors.Is(e, context.Canceled) {
-				v.State = "cancelled"
+		j.UpdatedAt = time.Now().UTC()
+		if runErr != nil {
+			j.Error = runErr.Error()
+			if errors.Is(runErr, context.Canceled) {
+				j.State = "cancelled"
 			} else {
-				v.State = "failed"
-				v.Error = e.Error()
+				j.State = "failed"
 			}
-			s.Jobs[v.ID] = v
-			s.Emit("job."+v.State, v.ID)
+			s.Jobs[j.ID] = j
+			s.Emit("job."+j.State, j.ID)
 			return nil
 		}
-		a := model.Artifact{ID: model.ID("png", s.Sequence+1), JobID: v.ID, State: "live", Digest: model.Digest(data), Width: plan.Width, Height: plan.Height, PNG: data}
-		s.Artifacts[a.ID] = a
-		v.State = "succeeded"
-		v.ArtifactID = a.ID
-		s.Jobs[v.ID] = v
-		s.Emit("job.succeeded", v.ID)
+		artifact := model.Artifact{ID: model.ID("png", s.Sequence+1), JobID: j.ID, State: "live", Digest: model.Digest(data), Width: width, Height: height, PNG: data}
+		s.Artifacts[artifact.ID] = artifact
+		j.State = "succeeded"
+		j.ArtifactID = artifact.ID
+		s.Jobs[j.ID] = j
+		s.Emit("job.succeeded", j.ID)
 		return nil
 	})
 }

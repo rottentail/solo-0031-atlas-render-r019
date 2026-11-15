@@ -350,6 +350,32 @@
         "通过存储或渲染结果观察已提交事实"
       ],
       "verification": "python3 scripts/walkthrough.py --workflow observe-service"
+    },
+    {
+      "id": "attempt-ownership",
+      "name": "执行资源归属",
+      "entry": "进程启动 Recover",
+      "success": "取消、立即重试和退出相遇时旧执行不触碰新尝试且不泄漏句柄",
+      "failure": "新尝试被旧执行改写或句柄残留",
+      "module_ids": "engine",
+      "steps": [
+        "经公开HTTP入口完成领域转换",
+        "通过存储或渲染结果观察已提交事实"
+      ],
+      "verification": "python3 scripts/walkthrough.py --workflow attempt-ownership"
+    },
+    {
+      "id": "state-compat",
+      "name": "持久任务状态兼容",
+      "entry": "进程启动 Recover",
+      "success": "旧状态文件的多余输入副本被接受并以稳定事实继续",
+      "failure": "旧文件拒绝启动或任务详情形状变化",
+      "module_ids": "persist",
+      "steps": [
+        "经公开HTTP入口完成领域转换",
+        "通过存储或渲染结果观察已提交事实"
+      ],
+      "verification": "python3 scripts/walkthrough.py --workflow state-compat"
     }
   ],
   "complexity": {

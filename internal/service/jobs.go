@@ -8,6 +8,10 @@ import (
 	"time"
 )
 
+// Submit records a durable render promise. It resolves the pinned snapshot
+// only to validate the request and to check the work budget; the snapshot
+// record itself stays the single input source, so the job carries no copy of
+// the document.
 func (s *Service) Submit(snapshotID string, scale int, key string) (model.Job, error) {
 	var out model.Job
 	if !scene.ValidID(key) {
@@ -32,17 +36,11 @@ func (s *Service) Submit(snapshotID string, scale int, key string) (model.Job, e
 		if _, e := raster.Compile(snap, scale); e != nil {
 			return e
 		}
-		pending := 0
-		for _, j := range st.Jobs {
-			if j.State == "queued" || j.State == "running" {
-				pending++
-			}
-		}
-		if pending >= 64 {
+		if pending(st) >= 64 {
 			return model.Busy("render queue is full")
 		}
 		now := time.Now().UTC()
-		out = model.Job{ID: model.ID("job", st.Sequence+1), SnapshotID: snapshotID, State: "queued", Scale: scale, Attempt: 1, CreatedAt: now, UpdatedAt: now, Payload: snap}
+		out = model.Job{ID: model.ID("job", st.Sequence+1), SnapshotID: snapshotID, State: "queued", Scale: scale, Attempt: 1, CreatedAt: now, UpdatedAt: now}
 		st.Jobs[out.ID] = out
 		st.Receipts[key] = model.Receipt{Key: key, Fingerprint: fingerprint, JobID: out.ID}
 		st.Emit("job.queued", out.ID)
@@ -50,6 +48,21 @@ func (s *Service) Submit(snapshotID string, scale int, key string) (model.Job, e
 	})
 	return out, e
 }
+
+func pending(st *model.State) int {
+	n := 0
+	for _, j := range st.Jobs {
+		if j.State == "queued" || j.State == "running" {
+			n++
+		}
+	}
+	return n
+}
+
+// Cancel commits the cancelled terminal state and returns the job with the
+// attempt number that was running, so the executor can target exactly that
+// attempt's handle. The returned job is a stable fact; the executor-owned
+// context is not part of it.
 func (s *Service) Cancel(id string) (model.Job, error) {
 	var out model.Job
 	e := s.Store.Update(func(st *model.State) error {
@@ -73,6 +86,10 @@ func (s *Service) Cancel(id string) (model.Job, error) {
 	})
 	return out, e
 }
+
+// Retry reopens a failed or cancelled job as a new attempt. The new attempt
+// reuses the pinned snapshot reference and scale already stored on the job;
+// the previous attempt's executor resources were released when it ended.
 func (s *Service) Retry(id string) (model.Job, error) {
 	var out model.Job
 	e := s.Store.Update(func(st *model.State) error {
@@ -83,13 +100,7 @@ func (s *Service) Retry(id string) (model.Job, error) {
 		if j.State != "failed" && j.State != "cancelled" {
 			return model.Conflict("only failed or cancelled jobs can retry")
 		}
-		n := 0
-		for _, v := range st.Jobs {
-			if v.State == "queued" || v.State == "running" {
-				n++
-			}
-		}
-		if n >= 64 {
+		if pending(st) >= 64 {
 			return model.Busy("render queue is full")
 		}
 		j.State = "queued"
